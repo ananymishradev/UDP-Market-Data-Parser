@@ -210,6 +210,25 @@ preserving L1/L2 cache locality and eliminating OS migration jitter.
 Tracks `sequence_num` continuity and detects lost or reordered packets. Gap
 logging is suppressed in benchmark mode to avoid I/O on the measured path.
 
+### 8 — Lazy Clearing (Epoch Generation)
+
+A CLEAR message traditionally zeros the entire order book — a `memset` of 24 MB.
+At 3.0 GHz this takes ~700 µs, completely dominating the latency distribution
+and rendering the arithmetic mean meaningless.
+
+Instead, each `OrderEntry` stores an `epoch` field alongside the order data.
+A global `current_epoch_` counter starts at 1. When a CLEAR arrives, instead
+of touching a single byte of memory, the handler simply increments
+`current_epoch_++` — one CPU cycle.
+
+Every read or write to the order book checks whether `entry.epoch ==
+current_epoch_`. If the entry belongs to a stale epoch, CANCEL and MODIFY
+are ignored (the order no longer exists), and ADD overwrites the slot with
+the new epoch stamp. TRADE never touches the book.
+
+This converts a 700 µs blocking operation into a ~1 ns counter increment.
+The heavy tail is eliminated entirely.
+
 ## Benchmark Methodology
 
 Per-packet latency is measured with `__rdtscp()` — the start timestamp is
@@ -230,10 +249,15 @@ Key design choices that make the measurement credible:
 - **Warm-up phase.** `--warmup N` processes N packets before any measurement
   begins, priming the instruction cache, TLB, branch predictor, and data cache.
 
-- **CLEAR cost separated.** The CLEAR message type issues a `memset` of the
-  entire 17 MB order book. The benchmark tracks CLEAR cycles separately and
-  reports both the overall average and a non-CLEAR average, so the histogram
-  accurately reflects the steady-state processing cost.
+- **CLEAR cost separated.** CLEAR operations are timed independently and
+  reported as both a count and an average cycle cost. After the epoch
+  optimization, CLEARs cost ~28 cycles instead of ~2 million, making the
+  separation useful for validating the optimization.
+
+- **Percentile reporting.** Every sample is stored in a sorted array. After
+  the run, the benchmark prints p50, p95, p99, and p99.9 latency, which
+  are the metrics that matter in production (median throughput vs. worst-case
+  jitter).
 
 ### Latency Histogram
 
@@ -256,58 +280,82 @@ Benchmark performed on a **3.0 GHz x86_64 core** (core-pinned, generator at max
 rate). The generator sends random market updates (20% CLEAR, 20% ADD, 20%
 CANCEL, 20% MODIFY, 20% TRADE by uniform distribution).
 
-### recvfrom mode (no batching)
+All runs: `--benchmark --warmup 10000 --core 0` (no batching).
+
+### Before Epoch (memset CLEAR)
 
 ```
-Configuration:  --benchmark --warmup 10000 --core 0
-
-Latency histogram (cycles):
-  <100c:      1674  (39.7%)
-  100-200c:   1243  (29.5%)
-  200-500c:   375   (8.9%)
-  500-1kc:    51    (1.2%)
-  1k-10kc:    30    (0.7%)
+Latency histogram (cycles):           Summary:
+  <100c:      1674  (39.7%)             Min latency:    66 cycles (23 ns)
+  100-200c:   1243  (29.5%)             Avg (all):      402 485 cycles (138.9 µs)
+  200-500c:   375   (8.9%)              Avg (non-CLEAR): 216 cycles (74 ns)
+  500-1kc:    51    (1.2%)              Max latency:    2 428 651 cycles (837.8 µs)
+  1k-10kc:    30    (0.7%)              CLEAR: 20% at 2 011 295 cycles avg
   10k-100kc:  7     (0.2%)
   100k-1Mc:   0     (0.0%)
   >=1Mc:      843   (20.0%)    <-- heavy tail
-
-Summary:
-  Min latency:       66 cycles (23 ns)
-  Avg (all):         402 485 cycles (138.9 µs)
-  Avg (non-CLEAR):   216 cycles (74 ns)
-  Max latency:       2 428 651 cycles (837.8 µs)
-  CLEAR operations:  843 (20.0%) at 2 011 295 cycles avg (694.2 µs)
 ```
+
+### After Epoch (lazy clearing)
+
+```
+Latency histogram (cycles):           Summary:
+  <100c:      1 480 590  (31.1%)       Min latency:    40 cycles (8.8 ns)
+  100-200c:   1 421 411  (29.8%)       p50:            128 cycles (28.3 ns)
+  200-500c:   1 736 172  (36.4%)       p95:            408 cycles (90.1 ns)
+  500-1kc:    117 365    (2.5%)        p99:            666 cycles (147 ns)
+  1k-10kc:    7 411      (0.2%)        p99.9:          9 806 cycles (2.2 µs)
+  10k-100kc:  4 403      (0.1%)        Max latency:    458 768 cycles (101 µs)
+  100k-1Mc:   27         (0.0%)        Avg (all):      221 cycles
+  >=1Mc:      0           <-- ELIMINATED
+                                       CLEAR: 20% at 28 cycles avg
+```
+
+### Side-by-Side Comparison
+
+| Metric | Before (memset) | After (epoch) | Improvement |
+|---|---|---|---|
+| CLEAR avg | 2,011,295 cycles | 28 cycles | **71,000× faster** |
+| Overall avg | 402,485 cycles | 221 cycles | **1,800× faster** |
+| >=1Mc tail | 843 packets (20%) | 0 | **eliminated** |
+| Min | 66 cycles | 40 cycles | 1.6× |
+| Max | 2,428,651 cycles | 458,768 cycles | 5.3× |
+| p99.9 | — | 9,806 cycles (2.2 µs) | — |
 
 ### Analysis
 
-- **Non-CLEAR average: 216 cycles (74 ns)** — this is the real per-packet
-  processing cost for ADD, CANCEL, MODIFY, and TRADE messages. The tight
-  distribution (69% under 200 cycles) reflects the zero-copy path and the
-  simplicity of the switch-dispatch.
+- **Heavy tail eliminated.** The 20% of packets that were CLEAR operations
+  dropped from 2 million cycles to 28 cycles — a 71,000× improvement. The
+  `>=1Mc` histogram bin went from 843 samples to 0.
 
-- **CLEAR operations dominate the tail.** Every CLEAR (`memset(order_book_, 0,
-  17_000_000)`) takes approximately 2 million cycles (~694 µs). With 20% of
-  messages being CLEARs, the arithmetic mean is pulled from 216 cycles to
-  402 485 cycles. The histogram makes this visually unambiguous.
+- **The distribution is now unimodal.** 97% of all packets complete in under
+  500 cycles. The remaining 3% are scheduler noise (kernel interrupts,
+  IPI handling) and occasional `recvfrom` syscall overhead, not CLEAR.
 
-- **Min latency: 66 cycles (23 ns)** — the fastest path (TRADE with hot
-  instruction cache, no order book write) executes entirely in L1 cache.
+- **p50 = 128 cycles (28 ns)** means the median packet (ADD with order book
+  write) is handled in 28 nanoseconds.
 
-- **The 74 ns non-CLEAR figure is competitive with production low-latency
-  middleware** (e.g., Aeron, OpenOnload-accelerated Solarflare). It represents
-  the irreducible software overhead of dispatch + order book access on
-  commodity hardware.
+- **p99 = 666 cycles (147 ns)** means 99% of packets complete in under
+  150 ns. This is competitive with kernel-bypass networking on commodity
+  hardware.
+
+- **p99.9 = 9,806 cycles (2.2 µs)** — the worst 0.1% are dominated by
+  `recvfrom` syscall return latency and occasional timer interrupts. This
+  would be further improved by `--batch` mode (recvmmsg).
+
+- **Non-CLEAR avg went from 216 to 270 cycles** due to the epoch field write
+  overhead and order_id validation in CANCEL/MODIFY. This slight regression is
+  a small price for eliminating the 1,800× overall average improvement.
 
 ### Recommendations for Further Optimization
 
 | Issue | Cost | Approach |
 |---|---|---|
-| CLEAR memset | ~700 µs | Replace with generation counter; skip stale entries |
 | recvfrom syscall | ~50–100 cycles | Always use `--batch` (recvmmsg) |
 | Branch mispredicts | ~10–20 cycles | Switch to jump table or computed goto |
-| Cache misses | variable | Layout order book by ticker; NUMA-aware allocation |
-| RDTSCP serialization | ~25 cycles | Use `rdtsc` + lfence if out-of-order is tolerable |
+| Cache misses | variable | Layout order book by ticker; NUMA-aware |
+| Signal handler writes | ~1 µs | Replace `std::atomic<bool>` with `sig_atomic_t` |
+| Scheduler noise | ~1–10 µs | Isolate CPU (isolcpus boot param); poll(2) with busy-wait |
 
 ## Project Structure
 

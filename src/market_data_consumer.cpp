@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <cstring>
 #include <iostream>
+#include <algorithm>
 #include <x86intrin.h>
 
 static inline uint64_t rdtscp() {
@@ -16,7 +17,10 @@ static inline uint64_t rdtscp() {
 OrderEntry MarketDataConsumer::order_book_[MAX_ORDERS];
 
 MarketDataConsumer::MarketDataConsumer() {
-    std::memset(order_book_, 0, sizeof(order_book_));
+    volatile auto* page = reinterpret_cast<volatile uint8_t*>(order_book_);
+    for (size_t i = 0; i < sizeof(order_book_); i += 4096) {
+        page[i] = 0;
+    }
     for (size_t i = 0; i < BATCH_SIZE; i++) {
         batch_iov_[i].iov_base = batch_bufs_[i];
         batch_iov_[i].iov_len = sizeof(batch_bufs_[i]);
@@ -86,6 +90,7 @@ void MarketDataConsumer::start_polling(bool benchmark, int warmup_packets, bool 
         process_packet(rx_buffer_, bytes, benchmark);
         if (benchmark) {
             uint64_t cycles = rdtscp() - start;
+            bench_samples_.push_back(cycles);
             if (cycles < bench_min_) bench_min_ = cycles;
             if (cycles > bench_max_) bench_max_ = cycles;
             bench_total_ += cycles;
@@ -126,6 +131,7 @@ void MarketDataConsumer::poll_batch(bool benchmark, int warmup_packets) {
             process_packet(buf, len, benchmark);
             if (benchmark) {
                 uint64_t cycles = rdtscp() - start;
+                bench_samples_.push_back(cycles);
                 if (cycles < bench_min_) bench_min_ = cycles;
                 if (cycles > bench_max_) bench_max_ = cycles;
                 bench_total_ += cycles;
@@ -170,18 +176,25 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
             order_book_[idx].ticker_id = update->ticker_id;
             order_book_[idx].price = update->price;
             order_book_[idx].quantity = update->quantity;
+            order_book_[idx].epoch = current_epoch_;
             order_book_[idx].active = true;
             break;
         }
         case MarketUpdateType::CANCEL_ORDER: {
             size_t idx = update->order_id % MAX_ORDERS;
-            order_book_[idx].active = false;
+            if (order_book_[idx].epoch == current_epoch_ &&
+                order_book_[idx].order_id == update->order_id) {
+                order_book_[idx].active = false;
+            }
             break;
         }
         case MarketUpdateType::MODIFY_ORDER: {
             size_t idx = update->order_id % MAX_ORDERS;
-            order_book_[idx].price = update->price;
-            order_book_[idx].quantity = update->quantity;
+            if (order_book_[idx].epoch == current_epoch_ &&
+                order_book_[idx].order_id == update->order_id) {
+                order_book_[idx].price = update->price;
+                order_book_[idx].quantity = update->quantity;
+            }
             break;
         }
         case MarketUpdateType::TRADE:
@@ -189,7 +202,7 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
         case MarketUpdateType::CLEAR:
         {
             uint64_t cs = benchmark ? rdtscp() : 0;
-            std::memset(order_book_, 0, sizeof(order_book_));
+            current_epoch_++;
             if (benchmark) {
                 uint64_t ce = rdtscp() - cs;
                 bench_clear_count_++;
@@ -204,4 +217,21 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
                   << " qty=" << update->quantity
                   << " price=" << update->price << "\n";
     }
+}
+
+uint64_t MarketDataConsumer::bench_percentile(double p) const {
+    if (bench_samples_.empty()) return 0;
+    if (!bench_sorted_) {
+        std::sort(bench_samples_.begin(), bench_samples_.end());
+        bench_sorted_ = true;
+    }
+    size_t idx = std::min(
+        static_cast<size_t>(p / 100.0 * bench_samples_.size()),
+        bench_samples_.size() - 1
+    );
+    return bench_samples_[idx];
+}
+
+void MarketDataConsumer::finalize_bench() const {
+    bench_percentile(50.0);
 }

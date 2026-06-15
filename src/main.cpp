@@ -85,18 +85,29 @@ int main(int argc, char* argv[]) {
             double pct = 100.0 * hist[i] / cnt;
             std::cout << "    " << bin_labels[i] << ": "
                       << hist[i] << " (" << pct << "%)";
-            if (i >= 5 && hist[i] > 0) std::cout << "  <-- heavy tail";
+            if (i >= 5 && hist[i] > 0 && hist[i] > cnt / 1000) std::cout << "  <-- heavy tail";
             std::cout << "\n";
         }
 
-        std::cout << "\n  Min latency:         " << consumer.bench_min_cycles()
-                  << " cycles (" << (consumer.bench_min_cycles() * ns_per_cycle) << " ns)\n";
+        consumer.finalize_bench();
+
+        std::cout << "\n  Latency (cycles):\n";
+        std::cout << "    Min:     " << consumer.bench_min_cycles()
+                  << " (" << (consumer.bench_min_cycles() * ns_per_cycle) << " ns)\n";
+        std::cout << "    p50:     " << consumer.bench_p50()
+                  << " (" << (consumer.bench_p50() * ns_per_cycle) << " ns)\n";
+        std::cout << "    p95:     " << consumer.bench_p95()
+                  << " (" << (consumer.bench_p95() * ns_per_cycle) << " ns)\n";
+        std::cout << "    p99:     " << consumer.bench_p99()
+                  << " (" << (consumer.bench_p99() * ns_per_cycle) << " ns)\n";
+        std::cout << "    p99.9:   " << consumer.bench_p99_9()
+                  << " (" << (consumer.bench_p99_9() * ns_per_cycle) << " ns)\n";
+        std::cout << "    Max:     " << consumer.bench_max_cycles()
+                  << " (" << (consumer.bench_max_cycles() * ns_per_cycle) << " ns)\n";
         std::cout << "  Avg (all packets):   " << consumer.bench_avg_cycles()
-                  << " cycles (" << (consumer.bench_avg_cycles() * ns_per_cycle) << " ns)\n";
+                  << " cycles\n";
         std::cout << "  Avg (non-CLEAR):     " << consumer.bench_non_clear_avg()
-                  << " cycles (" << (consumer.bench_non_clear_avg() * ns_per_cycle) << " ns)\n";
-        std::cout << "  Max latency:         " << consumer.bench_max_cycles()
-                  << " cycles (" << (consumer.bench_max_cycles() * ns_per_cycle) << " ns)\n";
+                  << " cycles\n";
     }
 
     return 0;

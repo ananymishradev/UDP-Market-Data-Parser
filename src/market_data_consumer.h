@@ -4,6 +4,7 @@
 #include <string>
 #include <atomic>
 #include <cstdint>
+#include <vector>
 #include <sys/socket.h>
 
 static constexpr size_t MAX_ORDERS = 1'000'000;
@@ -13,6 +14,7 @@ struct OrderEntry {
     uint32_t ticker_id;
     uint32_t price;
     uint32_t quantity;
+    uint32_t epoch;
     bool active;
 };
 
@@ -44,6 +46,11 @@ public:
         return (bench_total_ - bench_clear_cycles_) / non_clear;
     }
     const uint64_t* bench_hist() const { return bench_hist_; }
+    uint64_t bench_p50() const { return bench_percentile(50.0); }
+    uint64_t bench_p95() const { return bench_percentile(95.0); }
+    uint64_t bench_p99() const { return bench_percentile(99.0); }
+    uint64_t bench_p99_9() const { return bench_percentile(99.9); }
+    void finalize_bench() const;
 
 private:
     void process_packet(const char* buffer, ssize_t length, bool benchmark);
@@ -59,6 +66,7 @@ private:
     std::atomic<uint64_t> sequence_gaps_{0};
 
     static OrderEntry order_book_[MAX_ORDERS];
+    uint32_t current_epoch_ = 1;
 
     uint64_t bench_min_ = UINT64_MAX;
     uint64_t bench_max_ = 0;
@@ -68,6 +76,10 @@ private:
     uint64_t bench_clear_cycles_ = 0;
     static constexpr size_t HIST_BINS = 8;
     uint64_t bench_hist_[HIST_BINS] = {};
+    mutable std::vector<uint64_t> bench_samples_;
+    mutable bool bench_sorted_ = false;
+
+    uint64_t bench_percentile(double p) const;
 
     static constexpr size_t BATCH_SIZE = 64;
     struct iovec batch_iov_[BATCH_SIZE];
