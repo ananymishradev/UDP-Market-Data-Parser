@@ -12,15 +12,15 @@ using zero-copy parsing, aligned struct layout, non-blocking sockets, and
 │                              │  127.0.0.1    │                              │
 │  ┌────────────────────────┐  │   :20001      │  ┌────────────────────────┐  │
 │  │ while(running) {       │  │  32B packets  │  │ while(running) {       │  │
-│  │   fill MDPMarketUpdate │──┼──────────────┼──│   recvfrom()           │  │
-│  │   sendto(sock, &upd)   │  │              │  │   reinterpret_cast<>   │  │
-│  │   usleep(interval)     │  │              │  │   process_packet()     │  │
-│  │ }                      │  │              │  │   update order_book[]  │  │
-│  └────────────────────────┘  │              │  └────────────────────────┘  │
-│                              │              │                              │
-│  Types: CLEAR ADD MODIFY     │              │  Order book: 1M entries      │
-│         CANCEL TRADE         │              │  in BSS, epoch-gated         │
-└──────────────────────────────┘              └──────────────────────────────┘
+│  │   fill MDPMarketUpdate │──┼──────────────-┼──│   recvfrom()           │  │
+│  │   sendto(sock, &upd)   │  │               │  │   reinterpret_cast<>   │  │
+│  │   usleep(interval)     │  │               │  │   process_packet()     │  │
+│  │ }                      │  │               │  │   update order_book[]  │  │
+│  └────────────────────────┘  │               │  └────────────────────────┘  │
+│                              │               │                              │
+│  Types: CLEAR ADD MODIFY     │               │  Order book: 1M entries      │
+│         CANCEL TRADE         │               │  in BSS, epoch-gated         │
+└──────────────────────────────┘               └──────────────────────────────┘
 
   Wire format (32-byte naturally aligned struct):
   ┌───────┬────┬──────┬────┬─────┬─────┬────┬───┐
