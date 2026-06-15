@@ -9,14 +9,18 @@
 
 static constexpr size_t MAX_ORDERS = 1'000'000;
 
-struct OrderEntry {
+struct alignas(64) OrderEntry {
+    uint64_t last_update_ts;
     uint32_t order_id;
     uint32_t ticker_id;
     uint32_t price;
     uint32_t quantity;
     uint32_t epoch;
-    bool active;
+    bool     active;
+    char     padding[35];
 };
+
+static_assert(sizeof(OrderEntry) == 64, "OrderEntry must be exactly 64 bytes (one cache line)");
 
 class MarketDataConsumer {
 public:
@@ -26,7 +30,7 @@ public:
     MarketDataConsumer(const MarketDataConsumer&) = delete;
     MarketDataConsumer& operator=(const MarketDataConsumer&) = delete;
 
-    bool init(const std::string& ip, int port);
+    bool init(const std::string& ip, int port, bool use_multicast = false);
     void start_polling(bool benchmark, int warmup_packets = 0, bool use_batch = false);
     void stop();
     void set_cpu_affinity(int core_id);
@@ -59,6 +63,7 @@ private:
     int socket_fd_ = -1;
     alignas(alignof(MDPMarketUpdate)) char rx_buffer_[65536];
     bool running_ = false;
+    bool use_multicast_ = false;
 
     uint32_t last_sequence_num_ = 0;
     bool has_last_sequence_ = false;

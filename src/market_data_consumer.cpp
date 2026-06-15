@@ -1,5 +1,6 @@
 #include "market_data_consumer.h"
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -34,7 +35,7 @@ MarketDataConsumer::~MarketDataConsumer() {
     if (socket_fd_ >= 0) close(socket_fd_);
 }
 
-bool MarketDataConsumer::init(const std::string& ip, int port) {
+bool MarketDataConsumer::init(const std::string& ip, int port, bool use_multicast) {
     socket_fd_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd_ < 0) { perror("socket"); return false; }
 
@@ -53,6 +54,20 @@ bool MarketDataConsumer::init(const std::string& ip, int port) {
 
     if (bind(socket_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); close(socket_fd_); socket_fd_ = -1; return false;
+    }
+
+    if (use_multicast) {
+        struct ip_mreq mreq{};
+        mreq.imr_multiaddr.s_addr = inet_addr(ip.c_str());
+        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(socket_fd_, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                       &mreq, sizeof(mreq)) < 0) {
+            perror("IP_ADD_MEMBERSHIP");
+            close(socket_fd_);
+            socket_fd_ = -1;
+            return false;
+        }
+        use_multicast_ = true;
     }
     return true;
 }
@@ -172,6 +187,7 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
     switch (update->type) {
         case MarketUpdateType::ADD_ORDER: {
             size_t idx = update->order_id % MAX_ORDERS;
+            order_book_[idx].last_update_ts = update->timestamp;
             order_book_[idx].order_id = update->order_id;
             order_book_[idx].ticker_id = update->ticker_id;
             order_book_[idx].price = update->price;

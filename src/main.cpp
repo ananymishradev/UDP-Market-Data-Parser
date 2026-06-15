@@ -12,6 +12,7 @@ void signal_handler(int) {
 int main(int argc, char* argv[]) {
     bool benchmark = false;
     bool use_batch = false;
+    bool use_multicast = false;
     int core_id = -1;
     int port = 20001;
     int warmup = 0;
@@ -21,6 +22,8 @@ int main(int argc, char* argv[]) {
             benchmark = true;
         } else if (strcmp(argv[i], "--batch") == 0) {
             use_batch = true;
+        } else if (strcmp(argv[i], "--multicast") == 0) {
+            use_multicast = true;
         } else if (strcmp(argv[i], "--core") == 0 && i + 1 < argc) {
             core_id = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -34,7 +37,8 @@ int main(int argc, char* argv[]) {
     g_consumer = &consumer;
     signal(SIGINT, signal_handler);
 
-    if (!consumer.init("127.0.0.1", port)) {
+    const char* bind_ip = use_multicast ? "224.0.0.1" : "127.0.0.1";
+    if (!consumer.init(bind_ip, port, use_multicast)) {
         std::cerr << "Failed to initialize consumer on port " << port << "\n";
         return 1;
     }
@@ -44,6 +48,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Consumer listening on port " << port
               << (benchmark ? " (benchmark)" : "")
               << (use_batch ? " [batch]" : "")
+              << (use_multicast ? " [multicast]" : "")
               << (core_id >= 0 ? " [core " + std::to_string(core_id) + "]" : "")
               << (warmup > 0 ? " [warmup " + std::to_string(warmup) + "]" : "")
               << "\n";

@@ -138,28 +138,210 @@ A warm-up phase processes dummy packets before measurement starts. This:
 After 10,000 packets of warm-up, the system is in steady state and the
 measured latency reflects the true processing cost.
 
-## Usage
+## Build
 
-**Terminal 1 — Start the consumer:**
 ```bash
-./market_data_consumer                                 # verbose (prints trades)
-./market_data_consumer --benchmark                      # rdtscp latency measurement
-./market_data_consumer --benchmark --warmup 10000       # prime caches before measuring
-./market_data_consumer --benchmark --batch              # recvmmsg batching
-./market_data_consumer --benchmark --batch --warmup 10000  # full profile
-./market_data_consumer --core 3                         # pin to CPU core 3
-./market_data_consumer --port 20001                     # custom port
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -- -j$(nproc)
 ```
 
-**Terminal 2 — Start the mock generator:**
-```bash
-./mock_feed_generator                         # 1 packet/ms
-./mock_feed_generator --rate 100              # 10 kHz
-./mock_feed_generator --rate 100 --inject-gap # simulate sequence loss
-./mock_feed_generator --warmup 10000          # burst N packets at startup
+Expected output:
+```
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/user/udp-cpp/build
+[100%] Built target market_data_consumer
+[100%] Built target mock_feed_generator
 ```
 
-Hit Ctrl-C to stop the consumer and print the benchmark summary.
+Two binaries are produced:
+- `build/market_data_consumer` — the low-latency feed consumer
+- `build/mock_feed_generator` — the synthetic data broadcaster
+
+---
+
+## Commands to Showcase Performance
+
+All benchmarks use `--benchmark --warmup 10000` (measure every packet after
+10k warmup packets to prime caches, TLB, and branch predictor).
+
+### 1 — Quick Smoke Test (Verbose Mode)
+
+Verify the system works end-to-end with human-readable trade output.
+
+**Terminal 1:**
+```bash
+./build/market_data_consumer --port 20001
+```
+
+**Terminal 2:**
+```bash
+./build/mock_feed_generator --port 20001 --rate 10000
+```
+
+Expected output (Terminal 1):
+```
+TRADE: ticker=1002 qty=7431 price=58295
+TRADE: ticker=1005 qty=9464 price=36059
+...
+```
+
+Hit Ctrl-C on Terminal 1 to stop.
+
+---
+
+### 2 — Baseline Benchmark (Core 0 — Noisy)
+
+Demonstrates tail latency jitter caused by running on Core 0 (handles kernel
+timer interrupts, system daemons, IPIs).
+
+```bash
+taskset -c 0 ./build/market_data_consumer --benchmark --warmup 10000 --port 20002 &
+sleep 0.3
+taskset -c 1 ./build/mock_feed_generator --port 20002 --rate 100000 --warmup 10000
+sleep 2
+kill %1
+```
+
+Expected output:
+```
+  Latency (cycles):
+    Min:     34 (7.6 ns)
+    p50:     134 (29.9 ns)
+    p95:     674 (150.6 ns)
+    p99:     906 (202.5 ns)
+    p99.9:   17462 (3.9 µs)
+    Max:     41156 (9.2 µs)     <-- OS jitter on Core 0
+  Avg (all packets):   291 cycles
+  CLEAR: 20% at 22 cycles/clear
+```
+
+---
+
+### 3 — Isolated Core (Core 3 — Clean)
+
+Same workload, but the consumer is pinned to a higher core away from kernel
+interrupt handlers. This crushes the Max latency tail.
+
+```bash
+taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --port 20003 &
+sleep 0.3
+taskset -c 1 ./build/mock_feed_generator --port 20003 --rate 100000 --warmup 10000
+sleep 2
+kill %1
+```
+
+Expected improvement:
+```
+  Max latency drops from ~41k cycles (9 µs) to ~2k–10k cycles (<3 µs)
+  p99.9 drops from 17k cycles to ~2k cycles
+```
+
+---
+
+### 4 — Optimized (Isolated Core + recvmmsg Batch)
+
+Adds `--batch` to retrieve up to 64 packets per `recvmmsg` syscall instead of
+one per `recvfrom`. This cuts syscall overhead from ~50–100 cycles/packet to
+~1 cycle/packet amortized.
+
+```bash
+taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --batch --port 20004 &
+sleep 0.3
+taskset -c 1 ./build/mock_feed_generator --port 20004 --rate 100000 --warmup 10000
+sleep 2
+kill %1
+```
+
+Expected improvement:
+```
+  p50:  ~80–100 cycles (vs 134 no-batch)
+  p95:  ~200–400 cycles (vs 674 no-batch)
+  Max:  ~500–2000 cycles (vs 41k on Core 0)
+```
+
+---
+
+### 5 — Automated Benchmark Suite
+
+Runs all three configurations (Core 0 baseline → isolated core → isolated +
+batch) sequentially with a single command:
+
+```bash
+./run_benchmarks.sh
+```
+
+---
+
+### 6 — Multicast Mode (IGMP)
+
+Demonstrate UDP multicast ingestion, matching how real exchange feeds (NASDAQ
+ITCH, HKEX OMD) deliver data.
+
+**Terminal 1:**
+```bash
+taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --multicast --port 20005
+```
+
+**Terminal 2:**
+```bash
+taskset -c 1 ./build/mock_feed_generator --port 20005 --rate 100000 --multicast
+```
+
+The consumer joins `224.0.0.1` via `IP_ADD_MEMBERSHIP`; the generator sends
+to the multicast group instead of unicast `127.0.0.1`.
+
+---
+
+### 7 — High-Throughput Stress Test
+
+Push the system to 500,000 packets per second with sequence gap detection:
+
+**Terminal 1:**
+```bash
+taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --batch --port 20006
+```
+
+**Terminal 2:**
+```bash
+taskset -c 1 ./build/mock_feed_generator --port 20006 --rate 500000 --inject-gap
+```
+
+Expected:
+```
+  Packets processed: ~800000
+  Sequence gaps:     ~800         (0.1% injected)
+  Benchmark samples: ~790000
+  CLEAR: 20% at ~22 cycles/clear
+  Avg (non-CLEAR):  ~300–400 cycles
+```
+
+---
+
+## CLI Reference
+
+### market_data_consumer
+
+| Flag | Description |
+|------|-------------|
+| `--benchmark` | Enable per-packet `rdtscp` latency measurement |
+| `--batch` | Use `recvmmsg` batching (up to 64 pkts/syscall) |
+| `--multicast` | Join IGMP multicast group `224.0.0.1` |
+| `--core N` | Pin consumer to CPU core N |
+| `--port N` | Listen on port N (default: 20001) |
+| `--warmup N` | Discard first N packets from measurement |
+
+### mock_feed_generator
+
+| Flag | Description |
+|------|-------------|
+| `--rate N` | Send N packets per second (default: 1000) |
+| `--multicast` | Send to multicast group `224.0.0.1` |
+| `--inject-gap` | Skip a sequence number every 1000 packets |
+| `--warmup N` | Burst N packets at startup before rate-limiting |
+| `--port N` | Target port (default: 20001) |
+
+---
 
 ## Design
 
@@ -360,9 +542,11 @@ Latency histogram (cycles):           Summary:
 |---|---|---|
 | recvfrom syscall | ~50–100 cycles | Always use `--batch` (recvmmsg) |
 | Branch mispredicts | ~10–20 cycles | Switch to jump table or computed goto |
-| Cache misses | variable | Layout order book by ticker; NUMA-aware |
+| Cache-line thrashing | variable | `alignas(64)` on `OrderEntry` (implemented) |
+| Scheduler noise | ~1–10 µs | Pin to non-zero core via `--core N` or `taskset` |
+| Kernel jitter | ~10–100 µs | Boot with `isolcpus=N` kernel parameter |
 | Signal handler writes | ~1 µs | Replace `std::atomic<bool>` with `sig_atomic_t` |
-| Scheduler noise | ~1–10 µs | Isolate CPU (isolcpus boot param); poll(2) with busy-wait |
+| Cache misses | variable | Layout order book by ticker; NUMA-aware |
 
 ## Project Structure
 
@@ -371,10 +555,11 @@ Latency histogram (cycles):           Summary:
 ├── LICENSE
 ├── .gitignore
 ├── README.md
+├── run_benchmarks.sh              # Automated benchmark suite
 ├── include/
 │   └── market_data_parser.h      # Protocol definitions (aligned struct)
 └── src/
-    ├── market_data_consumer.h     # Consumer class header
+    ├── market_data_consumer.h     # Consumer class header (OrderEntry alignas(64))
     ├── market_data_consumer.cpp   # Consumer implementation
     ├── main.cpp                   # Entry point, CLI, benchmark summary
     └── mock_feed_generator.cpp    # Synthetic data broadcaster

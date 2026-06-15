@@ -17,7 +17,9 @@ static inline uint64_t nanos() {
 int main(int argc, char* argv[]) {
     int port = 20001;
     const char* ip = "127.0.0.1";
+    int rate = 1000;
     int interval_us = 1000;
+    bool multicast = false;
     bool inject_gap = false;
     int warmup = 0;
 
@@ -25,13 +27,18 @@ int main(int argc, char* argv[]) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             port = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--rate") == 0 && i + 1 < argc) {
-            interval_us = std::stoi(argv[++i]);
+            rate = std::stoi(argv[++i]);
+            interval_us = rate > 0 ? 1000000 / rate : 0;
+        } else if (strcmp(argv[i], "--multicast") == 0) {
+            multicast = true;
         } else if (strcmp(argv[i], "--inject-gap") == 0) {
             inject_gap = true;
         } else if (strcmp(argv[i], "--warmup") == 0 && i + 1 < argc) {
             warmup = std::stoi(argv[++i]);
         }
     }
+
+    if (multicast) ip = "224.0.0.1";
 
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) { perror("socket"); return 1; }
@@ -49,8 +56,9 @@ int main(int argc, char* argv[]) {
     uint32_t seq = 0;
 
     std::cout << "Broadcasting to " << ip << ":" << port
-              << " every " << interval_us << " us"
-              << (inject_gap ? " (injecting gaps)" : "")
+              << " at " << rate << " pkts/sec"
+              << (multicast ? " [multicast]" : "")
+              << (inject_gap ? " [injecting gaps]" : "")
               << (warmup > 0 ? " [warmup " + std::to_string(warmup) + "]" : "")
               << "\n";
 
