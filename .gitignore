@@ -1,0 +1,20 @@
+# Build output
+build/
+cmake-build-*/
+out/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled
+*.o
+*.obj
+*.exe
