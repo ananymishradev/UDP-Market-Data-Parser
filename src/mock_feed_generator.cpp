@@ -8,6 +8,8 @@
 #include <ctime>
 #include <iostream>
 
+// wall time for packet timestamp field. consumer does not use it for latency,
+// rdtscp on recv side does that. still fill something sane.
 static inline uint64_t nanos() {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -62,6 +64,7 @@ int main(int argc, char* argv[]) {
               << (warmup > 0 ? " [warmup " + std::to_string(warmup) + "]" : "")
               << "\n";
 
+    // warmup burst, no sleep. gets consumer caches hot fast.
     for (int i = 0; i < warmup; i++) {
         update.timestamp = nanos();
         update.sequence_num = ++seq;
@@ -73,6 +76,7 @@ int main(int argc, char* argv[]) {
         sendto(sock, &update, sizeof(update), 0, (struct sockaddr*)&dest, sizeof(dest));
     }
 
+    // main loop. rand() is not great but good enough for fake feed.
     while (true) {
         update.timestamp = nanos();
         update.sequence_num = ++seq;
@@ -86,6 +90,7 @@ int main(int argc, char* argv[]) {
                               (struct sockaddr*)&dest, sizeof(dest));
         if (sent < 0) perror("sendto");
 
+        // skip one seq every 1000 so consumer gap counter has something to find
         if (inject_gap && seq % 1000 == 0) seq++;
 
         if (interval_us > 0) usleep(interval_us);

@@ -5,6 +5,7 @@
 
 static MarketDataConsumer* g_consumer = nullptr;
 
+// ctrl-c just flips running_, loop exits clean and prints summary
 void signal_handler(int) {
     if (g_consumer) g_consumer->stop();
 }
@@ -17,6 +18,7 @@ int main(int argc, char* argv[]) {
     int port = 20001;
     int warmup = 0;
 
+    // plain arg scan, no lib needed for this few flags
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--benchmark") == 0) {
             benchmark = true;
@@ -45,6 +47,7 @@ int main(int argc, char* argv[]) {
 
     if (core_id >= 0) consumer.set_cpu_affinity(core_id);
 
+    // echo config so logs show what ran
     std::cout << "Consumer listening on port " << port
               << (benchmark ? " (benchmark)" : "")
               << (use_batch ? " [batch]" : "")
@@ -60,6 +63,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  Sequence gaps:     " << consumer.sequence_gaps() << "\n";
 
     if (benchmark && consumer.bench_count() > 0) {
+        // read cpu mhz for ns conversion. falls back to 3GHz math if unreadable.
         double cpu_mhz = 0.0;
         FILE* f = fopen("/proc/cpuinfo", "r");
         if (f) {

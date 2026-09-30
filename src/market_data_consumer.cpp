@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <x86intrin.h>
 
+// rdtscp directly, cheaper than chrono and serializing so numbers are stable
 static inline uint64_t rdtscp() {
     unsigned int lo, hi, aux;
     __asm__ volatile ("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux));
@@ -18,10 +19,13 @@ static inline uint64_t rdtscp() {
 OrderEntry MarketDataConsumer::order_book_[MAX_ORDERS];
 
 MarketDataConsumer::MarketDataConsumer() {
+    // touch each page once so first packets do not page fault.
+    // learned this the hard way, cold start looked awful.
     volatile auto* page = reinterpret_cast<volatile uint8_t*>(order_book_);
     for (size_t i = 0; i < sizeof(order_book_); i += 4096) {
         page[i] = 0;
     }
+    // set up recvmmsg bufs early, just pointer wiring
     for (size_t i = 0; i < BATCH_SIZE; i++) {
         batch_iov_[i].iov_base = batch_bufs_[i];
         batch_iov_[i].iov_len = sizeof(batch_bufs_[i]);
@@ -39,12 +43,13 @@ bool MarketDataConsumer::init(const std::string& ip, int port, bool use_multicas
     socket_fd_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (socket_fd_ < 0) { perror("socket"); return false; }
 
+    // nonblock so we can spin instead of sleeping in kernel
     int flags = fcntl(socket_fd_, F_GETFL, 0);
     if (fcntl(socket_fd_, F_SETFL, flags | O_NONBLOCK) < 0) { perror("fcntl"); return false; }
 
     int optval = 1;
     setsockopt(socket_fd_, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-    int rcvbuf = 4 * 1024 * 1024;
+    int rcvbuf = 4 * 1024 * 1024; // 4MB, default was dropping at 500k pps
     setsockopt(socket_fd_, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
     struct sockaddr_in addr{};
@@ -93,7 +98,7 @@ void MarketDataConsumer::start_polling(bool benchmark, int warmup_packets, bool 
     while (running_) {
         ssize_t bytes = recvfrom(socket_fd_, rx_buffer_, sizeof(rx_buffer_), 0,
                                  (struct sockaddr*)&from_addr, &from_len);
-        if (bytes <= 0) continue;
+        if (bytes <= 0) continue; // EAGAIN most of the time, just spin
 
         if (warmup_remaining > 0) {
             process_packet(rx_buffer_, bytes, false);
@@ -110,6 +115,7 @@ void MarketDataConsumer::start_polling(bool benchmark, int warmup_packets, bool 
             if (cycles > bench_max_) bench_max_ = cycles;
             bench_total_ += cycles;
             bench_count_++;
+            // bin it for the histogram. thresholds picked by eyeballing data.
             size_t bin = cycles < 100 ? 0
                       : cycles < 200 ? 1
                       : cycles < 500 ? 2
@@ -168,8 +174,10 @@ void MarketDataConsumer::poll_batch(bool benchmark, int warmup_packets) {
 void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool benchmark) {
     if (length < static_cast<ssize_t>(sizeof(MDPMarketUpdate))) return;
 
+    // zero copy. buffer already holds the struct, just cast.
     const auto* update = reinterpret_cast<const MDPMarketUpdate*>(buffer);
 
+    // gap check. noisy in normal mode, silent in bench (no IO while timing).
     if (has_last_sequence_) {
         uint32_t expected = last_sequence_num_ + 1;
         if (update->sequence_num != expected) {
@@ -198,6 +206,8 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
         }
         case MarketUpdateType::CANCEL_ORDER: {
             size_t idx = update->order_id % MAX_ORDERS;
+            // only touch if slot is from this epoch and ids match.
+            // stale slots are already dead, skip.
             if (order_book_[idx].epoch == current_epoch_ &&
                 order_book_[idx].order_id == update->order_id) {
                 order_book_[idx].active = false;
@@ -214,9 +224,11 @@ void MarketDataConsumer::process_packet(const char* buffer, ssize_t length, bool
             break;
         }
         case MarketUpdateType::TRADE:
+            // nothing to store for trades, just count it
             break;
         case MarketUpdateType::CLEAR:
         {
+            // the fast path. old code did memset here, 700us. now one inc.
             uint64_t cs = benchmark ? rdtscp() : 0;
             current_epoch_++;
             if (benchmark) {
@@ -249,5 +261,5 @@ uint64_t MarketDataConsumer::bench_percentile(double p) const {
 }
 
 void MarketDataConsumer::finalize_bench() const {
-    bench_percentile(50.0);
+    bench_percentile(50.0); // sorts once, getters after this are cheap
 }

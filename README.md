@@ -1,8 +1,6 @@
-# Minimal UDP Market Data Parser
+# Minimal UDP market data parser
 
-Low-latency market data feed consumer and mock synthetic generator in C++17,
-using zero-copy parsing, aligned struct layout, non-blocking sockets, and
-`rdtscp`-based per-packet latency measurement.
+Small C++17 project that eats a market data feed over UDP and measures how fast it can. There is a mock generator that sprays fake packets, and a consumer that parses them. Parsing is zero copy, structs are aligned, sockets are non blocking, latency is measured per packet with `rdtscp`.
 
 ## Architecture
 
@@ -30,30 +28,19 @@ using zero-copy parsing, aligned struct layout, non-blocking sockets, and
   Offset: 0     8    12    16   20    24   28   31
 ```
 
-## Theory (Simple English)
+## Theory in plain words
 
-A UDP packet arrives at your network card as a sequence of electrical signals.
-The kernel copies it from the NIC driver into a socket buffer, and the program
-reads it with `recvfrom()`. That memory-to-memory copy already happened before
-our code runs. Everything from that point forward — turning bytes back into
-real data — is what this project measures.
+A UDP packet shows up at the network card as electrical signals. The kernel pulls it from the NIC driver into a socket buffer, then our program reads it with `recvfrom()`. That kernel copy already happened before our code runs. What we time here starts after that, turning those bytes back into usable fields.
 
-### Why Not Just Read the Struct Directly? (Alignment)
+### Why not read the struct directly? Alignment
 
-CPUs read memory in chunks (4 bytes, 8 bytes). If you try to read an 8-byte
-number from an address that is not a multiple of 8, the CPU has to do extra
-work: it reads two separate chunks, shifts the bits, and stitches them together.
-That is called an *unaligned access* and it costs 2–3× more cycles. Worse, on
-some architectures (ARM, MIPS) it crashes outright.
+CPUs like to read memory in chunks, 4 bytes or 8 bytes at a time. If you ask for an 8 byte number at an address that is not a multiple of 8, the CPU has to do two reads, shift bits around, and stitch the result together. Slow. On some chips (ARM, MIPS) it just faults.
 
-Our struct avoids this by placing `uint64_t` first (always 8-byte aligned
-because it is at offset 0), then the `uint32_t` fields (naturally 4-byte
-aligned after an 8-byte start), then the 1-byte field. No `#pragma pack`, no
-misaligned reads.
+I put `uint64_t` first so it sits at offset 0, always 8 byte aligned. Then the five `uint32_t` fields follow, all naturally aligned. Then the 1 byte type at the end. No `#pragma pack`, no fixups.
 
-### What Is "Zero-Copy" Parsing?
+### What zero copy means here
 
-Normally you would write:
+The usual way looks like this:
 ```cpp
 uint64_t ts;
 uint32_t seq;
@@ -61,82 +48,43 @@ memcpy(&ts, buf + 0, 8);
 memcpy(&seq, buf + 8, 4);
 // ... 5 more fields
 ```
-That is 6 function calls, 6 loops, 6 cache-line touches. With zero-copy we
-just say:
+That is 6 copies to pull each field out. Instead I do:
 ```cpp
 const auto* u = reinterpret_cast<const MDPMarketUpdate*>(buffer);
 ```
-Now `u->timestamp`, `u->price`, every field, already exists at the right offset
-with zero instructions. The struct layout *is* the wire format. The bytes in
-the kernel buffer become the struct — no copy, no parse.
+The struct layout matches the wire exactly, so `u->price` and the rest are already there. No deserialize loop, no per packet alloc. Zero instructions for parsing, just a cast.
 
-### Why Does CLEAR Cost 2 Million Cycles? (Cache)
+### Why CLEAR was so slow? Cache
 
-Your order book is `OrderEntry[1_000_000]`. Each entry is 20 bytes, so the
-whole array is 20 MB. Your CPU's L1 cache is 32 KB. L2 is 256 KB. L3 might be
-8–16 MB. The order book does not fit in *any* cache.
+The order book is `OrderEntry[1_000_000]`. At 20 bytes each that is 20 MB. L1 is 32 KB, L2 is 256 KB, L3 is maybe 8 to 16 MB on this box. So the book fits nowhere on chip.
 
-When `memset(order_book_, 0, sizeof(order_book_))` runs, the CPU has to write
-every single cache line. Most of those writes miss L1, miss L2, miss L3, and go
-all the way to main memory. Main memory takes roughly 100 nanoseconds per
-access. Writing 20 MB at 100 ns per cache line (64 bytes) works out to about
-31,000 accesses × 100 ns ≈ 3.1 milliseconds. That matches the ~700 µs we
-measure (the CPU writes in larger bursts and overlaps some latency).
+Old code did `memset(order_book_, 0, sizeof(order_book_))` on every CLEAR. That walks every cache line, misses all the way out to DRAM. DRAM is around 100 ns a pop. 20 MB divided into 64 byte lines is about 31k lines, so you end up in the milliseconds. We measured around 700 us, which lines up once the CPU overlaps some writes.
 
-This is why finance middleware rarely clears the full book. They use generation
-counters: mark entries as "version 5 is current", and when a CLEAR arrives,
-just increment to "version 6". Old entries become invisible instantly.
+Real feeds do not memset. They bump a generation number. I copied that trick, details in Design below.
 
-### Why Use RDTSCP Instead of Clock Time?
+### Why rdtscp and not chrono?
 
-`std::chrono::high_resolution_clock::now()` calls a system call or a VDSO
-function that touches kernel-managed data structures. It costs hundreds of
-cycles and the result is in nanoseconds, which is a coarse unit for sub-100 ns
-work.
+`std::chrono::high_resolution_clock::now()` goes through VDSO or kernel data, costs hundreds of cycles, and reports in ns. Too coarse for work that takes 20 ns.
 
-`rdtscp` reads the CPU's internal cycle counter directly from a register — no
-syscall, no memory access. On a 3.0 GHz CPU, one cycle is 0.33 ns. A TRADE
-that takes 70 cycles is genuinely taking about 23 ns. The instruction also
-serializes the pipeline (waits for all previous instructions to finish before
-reading the counter), so the measurement is accurate.
+`rdtscp` reads the CPU cycle counter straight from a register. No syscall, no memory touch. On a 3.0 GHz box one cycle is 0.33 ns, so a 70 cycle TRADE is about 23 ns. It also waits for earlier instructions to retire first, so the numbers do not smear.
 
-### What Is Busy-Polling?
+### Busy polling
 
-A blocking `recvfrom()` tells the kernel "wake me when data arrives". That
-requires a context switch (the kernel saves all registers, switches to another
-process, switches back later, restores everything). Context switches take
-1–10 µs, which is 1000–10000 cycles.
+Blocking `recvfrom()` puts the thread to sleep until data comes. Wakeup means a context switch, save registers, switch out, switch back in, restore. That is 1 to 10 us, or 1000s of cycles.
 
-Non-blocking mode makes `recvfrom()` return immediately — either with data or
-with `EAGAIN`. The program spins in a `while(true)` loop calling it over and
-over. This burns CPU (100% core utilization) but eliminates the context switch.
-When every microsecond matters, this trade-off is worth it.
+Here the socket is non blocking, so `recvfrom()` returns right away with data or `EAGAIN`. The loop just spins and keeps calling it. Yes, it pins a core at 100%. For this kind of test that trade is fine.
 
-### Why recvmmsg Batching?
+### Why recvmmsg helps
 
-Every `recvfrom()` is a syscall. Syscalls flush the TLB (translation lookaside
-buffer — the cache that maps virtual addresses to physical ones), which causes
-cache misses on return. A single syscall costs roughly 50–100 cycles of
-overhead plus the TLB disruption.
+Each `recvfrom()` is a syscall. Syscalls mess with the TLB and cost something like 50 to 100 cycles plus the disruption on return.
 
-`recvmmsg()` can grab up to 64 packets in one syscall. Instead of paying the
-syscall tax 64 times, you pay it once. On high-rate feeds this cuts the
-syscall overhead from ~50% of CPU to ~1%.
+`recvmmsg()` grabs up to 64 packets in one call. You pay that entry cost once instead of 64 times. At high packet rates that drops syscall overhead from a big chunk of CPU to noise.
 
-### What Is a Warm-Up?
+### Warm up
 
-When the program starts, nothing is in cache. The first packet causes misses on
-the program code, the packet buffer, the order book, the stack. Cold cache
-latency can be 10× higher than hot cache.
+Fresh process, cold caches. First packets miss on code, on buffers, on the book, on page tables. Cold can look 10x slower than steady state.
 
-A warm-up phase processes dummy packets before measurement starts. This:
-- Brings the hot code path into L1 instruction cache
-- Fills the branch predictor with the correct patterns
-- Loads the order book into L3 cache
-- Warms the TLB for all the memory pages
-
-After 10,000 packets of warm-up, the system is in steady state and the
-measured latency reflects the true processing cost.
+So `--warmup 10000` runs 10k packets through the normal path before timing starts. That pulls hot code into L1i, trains the branch predictor, fills TLB entries. After that the numbers show real processing cost.
 
 ## Build
 
@@ -155,19 +103,18 @@ Expected output:
 ```
 
 Two binaries are produced:
-- `build/market_data_consumer` — the low-latency feed consumer
-- `build/mock_feed_generator` — the synthetic data broadcaster
+- `build/market_data_consumer` - the low-latency feed consumer
+- `build/mock_feed_generator` - the synthetic data broadcaster
 
 ---
 
-## Commands to Showcase Performance
+## Commands to show performance
 
-All benchmarks use `--benchmark --warmup 10000` (measure every packet after
-10k warmup packets to prime caches, TLB, and branch predictor).
+All benchmarks use `--benchmark --warmup 10000` (time each packet after 10k warmup to settle caches, TLB, and branch predictor).
 
-### 1 — Quick Smoke Test (Verbose Mode)
+### 1 - Quick smoke test, verbose
 
-Verify the system works end-to-end with human-readable trade output.
+Just checks end to end works and prints trades.
 
 **Terminal 1:**
 ```bash
@@ -190,10 +137,9 @@ Hit Ctrl-C on Terminal 1 to stop.
 
 ---
 
-### 2 — Baseline Benchmark (Core 0 — Noisy)
+### 2 - Baseline benchmark, core 0, noisy
 
-Demonstrates tail latency jitter caused by running on Core 0 (handles kernel
-timer interrupts, system daemons, IPIs).
+Core 0 takes kernel timer ticks, daemons, IPIs, so the tail jitters. Good for showing the problem.
 
 ```bash
 taskset -c 0 ./build/market_data_consumer --benchmark --warmup 10000 --port 20002 &
@@ -218,10 +164,9 @@ Expected output:
 
 ---
 
-### 3 — Isolated Core (Core 3 — Clean)
+### 3 - Isolated core, core 3, clean
 
-Same workload, but the consumer is pinned to a higher core away from kernel
-interrupt handlers. This crushes the Max latency tail.
+Same load, consumer pinned away from interrupt heavy cores. Max tail drops a lot.
 
 ```bash
 taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --port 20003 &
@@ -233,17 +178,15 @@ kill %1
 
 Expected improvement:
 ```
-  Max latency drops from ~41k cycles (9 µs) to ~2k–10k cycles (<3 µs)
+  Max latency drops from ~41k cycles (9 µs) to ~2k-10k cycles (<3 µs)
   p99.9 drops from 17k cycles to ~2k cycles
 ```
 
 ---
 
-### 4 — Optimized (Isolated Core + recvmmsg Batch)
+### 4 - Optimized, isolated core plus recvmmsg
 
-Adds `--batch` to retrieve up to 64 packets per `recvmmsg` syscall instead of
-one per `recvfrom`. This cuts syscall overhead from ~50–100 cycles/packet to
-~1 cycle/packet amortized.
+Adds `--batch` to pull up to 64 packets per `recvmmsg` call instead of one per `recvfrom`. Amortized syscall cost drops to about 1 cycle per packet.
 
 ```bash
 taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --batch --port 20004 &
@@ -255,17 +198,16 @@ kill %1
 
 Expected improvement:
 ```
-  p50:  ~80–100 cycles (vs 134 no-batch)
-  p95:  ~200–400 cycles (vs 674 no-batch)
-  Max:  ~500–2000 cycles (vs 41k on Core 0)
+  p50:  ~80-100 cycles (vs 134 no-batch)
+  p95:  ~200-400 cycles (vs 674 no-batch)
+  Max:  ~500-2000 cycles (vs 41k on Core 0)
 ```
 
 ---
 
-### 5 — Automated Benchmark Suite
+### 5 - Automated suite
 
-Runs all three configurations (Core 0 baseline → isolated core → isolated +
-batch) sequentially with a single command:
+Runs baseline, then isolated, then isolated plus batch, back to back:
 
 ```bash
 ./run_benchmarks.sh
@@ -273,10 +215,9 @@ batch) sequentially with a single command:
 
 ---
 
-### 6 — Multicast Mode (IGMP)
+### 6 - Multicast mode (IGMP)
 
-Demonstrate UDP multicast ingestion, matching how real exchange feeds (NASDAQ
-ITCH, HKEX OMD) deliver data.
+Same as unicast but over multicast, closer to how NASDAQ ITCH and HKEX OMD ship feeds.
 
 **Terminal 1:**
 ```bash
@@ -288,14 +229,13 @@ taskset -c 3 ./build/market_data_consumer --benchmark --warmup 10000 --multicast
 taskset -c 1 ./build/mock_feed_generator --port 20005 --rate 100000 --multicast
 ```
 
-The consumer joins `224.0.0.1` via `IP_ADD_MEMBERSHIP`; the generator sends
-to the multicast group instead of unicast `127.0.0.1`.
+Consumer joins `224.0.0.1` with `IP_ADD_MEMBERSHIP`. Generator sends to the group instead of `127.0.0.1`.
 
 ---
 
-### 7 — High-Throughput Stress Test
+### 7 - High throughput stress
 
-Push the system to 500,000 packets per second with sequence gap detection:
+Push 500k packets per sec with gap injection on:
 
 **Terminal 1:**
 ```bash
@@ -313,12 +253,12 @@ Expected:
   Sequence gaps:     ~800         (0.1% injected)
   Benchmark samples: ~790000
   CLEAR: 20% at ~22 cycles/clear
-  Avg (non-CLEAR):  ~300–400 cycles
+  Avg (non-CLEAR):  ~300-400 cycles
 ```
 
 ---
 
-## CLI Reference
+## CLI reference
 
 ### market_data_consumer
 
@@ -345,11 +285,9 @@ Expected:
 
 ## Design
 
-### 1 — Naturally Aligned Struct Layout
+### 1 - Aligned struct, biggest fields first
 
-Fields are ordered by descending size (`uint64_t` → `uint32_t` ×5 → `uint8_t`).
-The compiler naturally aligns each field without padding bytes, avoiding
-unaligned access penalties from `#pragma pack`.
+Fields go `uint64_t`, then five `uint32_t`, then `uint8_t`. Compiler aligns each one with no extra padding except the 3 tail bytes to round to 32. That avoids the penalty from `#pragma pack`.
 
 | Field | Type | Offset | Size |
 |---|---|---|---|
@@ -360,118 +298,83 @@ unaligned access penalties from `#pragma pack`.
 | price | uint32_t | 20 | 4 |
 | quantity | uint32_t | 24 | 4 |
 | type | uint8_t | 28 | 1 |
-| *(padding)* | — | 29 | 3 |
+| *(padding)* | - | 29 | 3 |
 | **Total** | | | **32** |
 
-The receive buffer is declared `alignas(alignof(MDPMarketUpdate))`,
-guaranteeing that the `reinterpret_cast` produces a properly aligned pointer
-with no fix-up stalls.
+Receive buffer is `alignas(alignof(MDPMarketUpdate))`, so the cast lands aligned. No fix up stalls.
 
-### 2 — Zero-Copy Parsing
+### 2 - Zero copy parsing
 
-`reinterpret_cast<const MDPMarketUpdate*>(buffer)` maps raw bytes directly into
-the struct. There is no deserialization, no field-by-field copy, and no memory
-allocation per packet.
+`reinterpret_cast<const MDPMarketUpdate*>(buffer)` treats the bytes as the struct. No deserialize, no field copy, no alloc per packet.
 
-### 3 — Non-Blocking Busy-Polling
+### 3 - Non blocking busy poll
 
-The socket is `O_NONBLOCK`. The consumer spins in a tight `while(running_)`
-loop — no blocking syscalls and no context switches on the hot path.
+Socket is `O_NONBLOCK`. Consumer spins in `while(running_)`. No blocking call in the hot path, no context switch to wait for data.
 
-### 4 — recvmmsg Batching (optional)
+### 4 - recvmmsg batching, optional
 
-With `--batch`, the consumer calls `recvmmsg()` to fetch up to 64 UDP packets
-in a single kernel transition, amortizing syscall overhead on high-throughput
-streams.
+With `--batch`, one `recvmmsg()` pulls up to 64 UDP datagrams. Helps a lot when the feed runs fast.
 
-### 5 — No Dynamic Allocations
+### 5 - No allocs on hot path
 
-A static `OrderEntry[1_000_000]` array in BSS replaces all heap allocation.
-Zero `new`/`delete`/`malloc` on the hot path.
+Static `OrderEntry[1_000_000]` lives in BSS. Zero `new` or `malloc` while polling.
 
-### 6 — Thread Affinity
+### 6 - Thread affinity
 
-`pthread_setaffinity_np` pins the polling thread to a dedicated core,
-preserving L1/L2 cache locality and eliminating OS migration jitter.
+`pthread_setaffinity_np` sticks the poll loop to one core. Keeps L1 and L2 hot and stops the OS bouncing the thread around.
 
-### 7 — Sequence Gap Detection
+### 7 - Gap check
 
-Tracks `sequence_num` continuity and detects lost or reordered packets. Gap
-logging is suppressed in benchmark mode to avoid I/O on the measured path.
+Keeps last `sequence_num`, flags skips or reorders. Logging goes to stderr, and stays off in benchmark mode so IO does not pollute timings.
 
-### 8 — Lazy Clearing (Epoch Generation)
+### 8 - Lazy clear with epoch
 
-A CLEAR message traditionally zeros the entire order book — a `memset` of 24 MB.
-At 3.0 GHz this takes ~700 µs, completely dominating the latency distribution
-and rendering the arithmetic mean meaningless.
+Old CLEAR did a full `memset` over 24 MB. On 3.0 GHz that was about 700 us, swamped everything else and made the mean useless.
 
-Instead, each `OrderEntry` stores an `epoch` field alongside the order data.
-A global `current_epoch_` counter starts at 1. When a CLEAR arrives, instead
-of touching a single byte of memory, the handler simply increments
-`current_epoch_++` — one CPU cycle.
+Now each `OrderEntry` has an `epoch` alongside the order. Global `current_epoch_` starts at 1. On CLEAR I just do `current_epoch_++`. One instruction, touches nothing else.
 
-Every read or write to the order book checks whether `entry.epoch ==
-current_epoch_`. If the entry belongs to a stale epoch, CANCEL and MODIFY
-are ignored (the order no longer exists), and ADD overwrites the slot with
-the new epoch stamp. TRADE never touches the book.
+Reads and writes check `entry.epoch == current_epoch_`. Stale entries look dead. CANCEL and MODIFY skip them. ADD overwrites the slot and stamps the new epoch. TRADE does not touch the book at all.
 
-This converts a 700 µs blocking operation into a ~1 ns counter increment.
-The heavy tail is eliminated entirely.
+That turned a 700 us stall into a counter bump.
 
-## Benchmark Methodology
+## Benchmark method
 
-Per-packet latency is measured with `__rdtscp()` — the start timestamp is
-captured immediately after `recvfrom()`/`recvmmsg()` returns and the end
-timestamp after `process_packet()` completes. This isolates pure processing
-time from idle spin and generator wait.
+Start stamp is taken right after `recvfrom()` or `recvmmsg()` returns, end stamp after `process_packet()` finishes, both with `__rdtscp()`. So idle spin and generator sleep are outside the window. Pure processing only.
 
-Key design choices that make the measurement credible:
+A few things I did to keep numbers honest:
 
-- **Per-packet, not averaged over a window.** Every packet gets its own
-  start/end pair, producing a full latency distribution rather than a single
-  opaque average.
+- Per packet timing, not window averages. Each packet gets its own start and end, then I keep the full distribution.
 
-- **I/O-free measurement path.** `std::cout` trade printing and `std::cerr`
-  sequence-gap logging are suppressed when `--benchmark` is active, so disk
-  writes do not contaminate the timed section.
+- No IO while timing. Trade prints to `std::cout` and gap logs to `std::cerr` are off when `--benchmark` is set.
 
-- **Warm-up phase.** `--warmup N` processes N packets before any measurement
-  begins, priming the instruction cache, TLB, branch predictor, and data cache.
+- Warm up first. `--warmup N` runs N packets unmeasured to fill icache, TLB, predictor, data cache.
 
-- **CLEAR cost separated.** CLEAR operations are timed independently and
-  reported as both a count and an average cycle cost. After the epoch
-  optimization, CLEARs cost ~28 cycles instead of ~2 million, making the
-  separation useful for validating the optimization.
+- CLEARs timed separately. They are counted and averaged on their own. After the epoch fix they run about 28 cycles instead of 2M, and splitting them out makes that obvious.
 
-- **Percentile reporting.** Every sample is stored in a sorted array. After
-  the run, the benchmark prints p50, p95, p99, and p99.9 latency, which
-  are the metrics that matter in production (median throughput vs. worst-case
-  jitter).
+- Percentiles, not just mean. All samples go in an array, sort at end, print p50, p95, p99, p99.9. Median tells you typical cost, tail tells you jitter.
 
-### Latency Histogram
+### Latency histogram
 
-The benchmark bins every sample into one of eight buckets:
+Each sample lands in one of eight bins:
 
 | Range | Label |
 |---|---|
 | < 100 cycles | `<100c` |
-| 100–200 cycles | `100-200c` |
-| 200–500 cycles | `200-500c` |
-| 500–1000 cycles | `500-1kc` |
-| 1000–10000 cycles | `1k-10kc` |
-| 10000–100000 cycles | `10k-100kc` |
-| 100000–1M cycles | `100k-1Mc` |
+| 100-200 cycles | `100-200c` |
+| 200-500 cycles | `200-500c` |
+| 500-1000 cycles | `500-1kc` |
+| 1000-10000 cycles | `1k-10kc` |
+| 10000-100000 cycles | `10k-100kc` |
+| 100000-1M cycles | `100k-1Mc` |
 | >= 1M cycles | `>=1Mc` |
 
-## Build Results
+## Build results
 
-Benchmark performed on a **3.0 GHz x86_64 core** (core-pinned, generator at max
-rate). The generator sends random market updates (20% CLEAR, 20% ADD, 20%
-CANCEL, 20% MODIFY, 20% TRADE by uniform distribution).
+Ran on a 3.0 GHz x86_64 core, pinned, generator at max rate. Generator sends uniform random updates (20% CLEAR, 20% ADD, 20% CANCEL, 20% MODIFY, 20% TRADE).
 
 All runs: `--benchmark --warmup 10000 --core 0` (no batching).
 
-### Before Epoch (memset CLEAR)
+### Before epoch (memset CLEAR)
 
 ```
 Latency histogram (cycles):           Summary:
@@ -485,7 +388,7 @@ Latency histogram (cycles):           Summary:
   >=1Mc:      843   (20.0%)    <-- heavy tail
 ```
 
-### After Epoch (lazy clearing)
+### After epoch (lazy clearing)
 
 ```
 Latency histogram (cycles):           Summary:
@@ -500,7 +403,7 @@ Latency histogram (cycles):           Summary:
                                        CLEAR: 20% at 28 cycles avg
 ```
 
-### Side-by-Side Comparison
+### Side-by-side comparison
 
 | Metric | Before (memset) | After (epoch) | Improvement |
 |---|---|---|---|
@@ -509,46 +412,35 @@ Latency histogram (cycles):           Summary:
 | >=1Mc tail | 843 packets (20%) | 0 | **eliminated** |
 | Min | 66 cycles | 40 cycles | 1.6× |
 | Max | 2,428,651 cycles | 458,768 cycles | 5.3× |
-| p99.9 | — | 9,806 cycles (2.2 µs) | — |
+| p99.9 | - | 9,806 cycles (2.2 µs) | - |
 
-### Analysis
+### What I take from this
 
-- **Heavy tail eliminated.** The 20% of packets that were CLEAR operations
-  dropped from 2 million cycles to 28 cycles — a 71,000× improvement. The
-  `>=1Mc` histogram bin went from 843 samples to 0.
+- Heavy tail is gone. CLEARs went from 2M cycles to 28. The `>=1Mc` bin went from 843 hits to zero. That 20% chunk was the whole story.
 
-- **The distribution is now unimodal.** 97% of all packets complete in under
-  500 cycles. The remaining 3% are scheduler noise (kernel interrupts,
-  IPI handling) and occasional `recvfrom` syscall overhead, not CLEAR.
+- Rest looks tight. 97% of packets finish under 500 cycles now. Leftovers are scheduler noise and `recvfrom` cost, not CLEAR.
 
-- **p50 = 128 cycles (28 ns)** means the median packet (ADD with order book
-  write) is handled in 28 nanoseconds.
+- p50 is 128 cycles (28 ns). That is a normal ADD with a book write.
 
-- **p99 = 666 cycles (147 ns)** means 99% of packets complete in under
-  150 ns. This is competitive with kernel-bypass networking on commodity
-  hardware.
+- p99 is 666 cycles (147 ns). 99% under 150 ns on plain hardware is fine for my use.
 
-- **p99.9 = 9,806 cycles (2.2 µs)** — the worst 0.1% are dominated by
-  `recvfrom` syscall return latency and occasional timer interrupts. This
-  would be further improved by `--batch` mode (recvmmsg).
+- p99.9 is 9,806 cycles (2.2 us). That slice is mostly syscall return plus timer ticks. `--batch` helps here.
 
-- **Non-CLEAR avg went from 216 to 270 cycles** due to the epoch field write
-  overhead and order_id validation in CANCEL/MODIFY. This slight regression is
-  a small price for eliminating the 1,800× overall average improvement.
+- Non CLEAR avg ticked up from 216 to 270 cycles because of the extra epoch write and order_id check in CANCEL and MODIFY. Worth it for the 1800x win on the mean.
 
-### Recommendations for Further Optimization
+### Ideas if I keep tuning
 
 | Issue | Cost | Approach |
 |---|---|---|
-| recvfrom syscall | ~50–100 cycles | Always use `--batch` (recvmmsg) |
-| Branch mispredicts | ~10–20 cycles | Switch to jump table or computed goto |
+| recvfrom syscall | ~50-100 cycles | Always use `--batch` (recvmmsg) |
+| Branch mispredicts | ~10-20 cycles | Switch to jump table or computed goto |
 | Cache-line thrashing | variable | `alignas(64)` on `OrderEntry` (implemented) |
-| Scheduler noise | ~1–10 µs | Pin to non-zero core via `--core N` or `taskset` |
-| Kernel jitter | ~10–100 µs | Boot with `isolcpus=N` kernel parameter |
+| Scheduler noise | ~1-10 µs | Pin to non-zero core via `--core N` or `taskset` |
+| Kernel jitter | ~10-100 µs | Boot with `isolcpus=N` kernel parameter |
 | Signal handler writes | ~1 µs | Replace `std::atomic<bool>` with `sig_atomic_t` |
 | Cache misses | variable | Layout order book by ticker; NUMA-aware |
 
-## Project Structure
+## Project structure
 
 ```
 ├── CMakeLists.txt

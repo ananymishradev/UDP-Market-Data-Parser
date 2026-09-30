@@ -7,17 +7,20 @@
 #include <vector>
 #include <sys/socket.h>
 
+// 1M slots. lives in BSS, about 64MB with 64 byte entries. big but fine.
 static constexpr size_t MAX_ORDERS = 1'000'000;
 
+// one cache line per order. wastes space, saves thrashing.
+// epoch lets CLEAR just bump a counter instead of memset.
 struct alignas(64) OrderEntry {
     uint64_t last_update_ts;
     uint32_t order_id;
     uint32_t ticker_id;
     uint32_t price;
     uint32_t quantity;
-    uint32_t epoch;
+    uint32_t epoch;  // matches current_epoch_ if live
     bool     active;
-    char     padding[35];
+    char     padding[35]; // filler to hit 64
 };
 
 static_assert(sizeof(OrderEntry) == 64, "OrderEntry must be exactly 64 bytes (one cache line)");
@@ -38,6 +41,7 @@ public:
     uint64_t packets_processed() const { return packets_processed_.load(); }
     uint64_t sequence_gaps() const { return sequence_gaps_.load(); }
 
+    // benchmark getters. plain counters, nothing fancy.
     uint64_t bench_min_cycles() const { return bench_min_; }
     uint64_t bench_max_cycles() const { return bench_max_; }
     uint64_t bench_avg_cycles() const { return bench_count_ > 0 ? bench_total_ / bench_count_ : 0; }
@@ -71,8 +75,9 @@ private:
     std::atomic<uint64_t> sequence_gaps_{0};
 
     static OrderEntry order_book_[MAX_ORDERS];
-    uint32_t current_epoch_ = 1;
+    uint32_t current_epoch_ = 1; // bump on CLEAR, starts at 1 so zeroed book reads as stale
 
+    // timing state. samples kept for percentiles at end.
     uint64_t bench_min_ = UINT64_MAX;
     uint64_t bench_max_ = 0;
     uint64_t bench_total_ = 0;
